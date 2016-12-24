@@ -40,6 +40,8 @@
 #ifndef _WIN32
 #include <sys/time.h> /* for struct timeval */
 #else
+#define INCL_WINSOCK_API_PROTOTYPES 0 // Important! Do not include Winsock API definitions to avoid conflicts with API entry points defined below.
+#include <WinSock2.h>                 // For struct timeval
 #include "msvs/win32_interop/win32_types_hiredis.h"
 #endif
 
