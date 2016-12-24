@@ -34,7 +34,9 @@
 #include "fmacros.h"
 #include <string.h>
 #include <stdlib.h>
-#include <unistd.h>
+#ifndef _WIN32
+  #include <unistd.h>
+#endif
 #include <assert.h>
 #include <errno.h>
 #include <ctype.h>
@@ -43,10 +45,14 @@
 #include "net.h"
 #include "sds.h"
 
+#ifdef _WIN32
+#include "win32_hiredis.h"
+#endif
+
 static redisReply *createReplyObject(int type);
 static void *createStringObject(const redisReadTask *task, char *str, size_t len);
 static void *createArrayObject(const redisReadTask *task, int elements);
-static void *createIntegerObject(const redisReadTask *task, long long value);
+static void *createIntegerObject(const redisReadTask *task, PORT_LONGLONG value);
 static void *createNilObject(const redisReadTask *task);
 
 /* Default set of functions to build the reply. Keep in mind that such a
@@ -121,7 +127,7 @@ static void *createStringObject(const redisReadTask *task, char *str, size_t len
     memcpy(buf,str,len);
     buf[len] = '\0';
     r->str = buf;
-    r->len = len;
+    r->len = (int)len;
 
     if (task->parent) {
         parent = task->parent->obj;
@@ -156,7 +162,7 @@ static void *createArrayObject(const redisReadTask *task, int elements) {
     return r;
 }
 
-static void *createIntegerObject(const redisReadTask *task, long long value) {
+static void *createIntegerObject(const redisReadTask *task, PORT_LONGLONG value) {
     redisReply *r, *parent;
 
     r = createReplyObject(REDIS_REPLY_INTEGER);
@@ -236,7 +242,7 @@ int redisvFormatCommand(char **target, const char *format, va_list ap) {
                     if (newargv == NULL) goto memory_err;
                     curargv = newargv;
                     curargv[argc++] = curarg;
-                    totlen += bulklen(sdslen(curarg));
+                    totlen += (int)bulklen(sdslen(curarg));
 
                     /* curarg is put in argv so it can be overwritten. */
                     curarg = sdsempty();
@@ -329,11 +335,11 @@ int redisvFormatCommand(char **target, const char *format, va_list ap) {
                         goto fmt_invalid;
                     }
 
-                    /* Size: long long */
+                    /* Size: PORT_LONGLONG */
                     if (_p[0] == 'l' && _p[1] == 'l') {
                         _p += 2;
                         if (*_p != '\0' && strchr(intfmts,*_p) != NULL) {
-                            va_arg(ap,long long);
+                            va_arg(ap,PORT_LONGLONG);
                             goto fmt_valid;
                         }
                         goto fmt_invalid;
@@ -343,7 +349,7 @@ int redisvFormatCommand(char **target, const char *format, va_list ap) {
                     if (_p[0] == 'l') {
                         _p += 1;
                         if (*_p != '\0' && strchr(intfmts,*_p) != NULL) {
-                            va_arg(ap,long);
+                            va_arg(ap, PORT_LONG);
                             goto fmt_valid;
                         }
                         goto fmt_invalid;
@@ -385,7 +391,7 @@ int redisvFormatCommand(char **target, const char *format, va_list ap) {
         if (newargv == NULL) goto memory_err;
         curargv = newargv;
         curargv[argc++] = curarg;
-        totlen += bulklen(sdslen(curarg));
+        totlen += (int)bulklen(sdslen(curarg));
     } else {
         sdsfree(curarg);
     }
@@ -397,14 +403,14 @@ int redisvFormatCommand(char **target, const char *format, va_list ap) {
     totlen += 1+countDigits(argc)+2;
 
     /* Build the command at protocol level */
-    cmd = malloc(totlen+1);
+    cmd = (char *)malloc(totlen+1);
     if (cmd == NULL) goto memory_err;
 
     pos = sprintf(cmd,"*%d\r\n",argc);
     for (j = 0; j < argc; j++) {
-        pos += sprintf(cmd+pos,"$%zu\r\n",sdslen(curargv[j]));
+        pos += sprintf(cmd+pos,"$%Iu\r\n",sdslen(curargv[j]));                  WIN_PORT_FIX /* %zu -> %Iu */
         memcpy(cmd+pos,curargv[j],sdslen(curargv[j]));
-        pos += sdslen(curargv[j]);
+        pos += (int)sdslen(curargv[j]);
         sdsfree(curargv[j]);
         cmd[pos++] = '\r';
         cmd[pos++] = '\n';
@@ -541,7 +547,7 @@ int redisFormatCommandArgv(char **target, int argc, const char **argv, const siz
     totlen = 1+countDigits(argc)+2;
     for (j = 0; j < argc; j++) {
         len = argvlen ? argvlen[j] : strlen(argv[j]);
-        totlen += bulklen(len);
+        totlen += (int)bulklen(len);
     }
 
     /* Build the command at protocol level */
@@ -552,9 +558,9 @@ int redisFormatCommandArgv(char **target, int argc, const char **argv, const siz
     pos = sprintf(cmd,"*%d\r\n",argc);
     for (j = 0; j < argc; j++) {
         len = argvlen ? argvlen[j] : strlen(argv[j]);
-        pos += sprintf(cmd+pos,"$%zu\r\n",len);
+        pos += sprintf(cmd+pos,"$%Iu\r\n",len);                                 WIN_PORT_FIX /* %zu -> %Iu */
         memcpy(cmd+pos,argv[j],len);
-        pos += len;
+        pos += (int)len;
         cmd[pos++] = '\r';
         cmd[pos++] = '\n';
     }
@@ -772,6 +778,16 @@ redisContext *redisConnectFd(int fd) {
     return c;
 }
 
+#ifdef _WIN32
+redisContext *redisPreConnectNonBlock(const char *ip, int port, SOCKADDR_STORAGE *ss) {
+    redisContext *c = redisContextInit();
+    c->fd = -1;
+    c->flags &= ~REDIS_BLOCK;
+    redisContextPreConnectTcp(c, ip, port, NULL, ss);
+    return c;
+}
+#endif
+
 /* Set read/write timeout on a blocking socket. */
 int redisSetTimeout(redisContext *c, const struct timeval tv) {
     if (c->flags & REDIS_BLOCK)
@@ -799,7 +815,7 @@ int redisBufferRead(redisContext *c) {
     if (c->err)
         return REDIS_ERR;
 
-    nread = read(c->fd,buf,sizeof(buf));
+    nread = (int)read(c->fd,buf,sizeof(buf));                                   WIN_PORT_FIX /* cast (int) */
     if (nread == -1) {
         if ((errno == EAGAIN && !(c->flags & REDIS_BLOCK)) || (errno == EINTR)) {
             /* Try again later */
@@ -819,6 +835,33 @@ int redisBufferRead(redisContext *c) {
     return REDIS_OK;
 }
 
+#ifdef _WIN32
+/* Use this function if the caller has already read the data. It will
+ * feed bytes to the reply parser.
+ *
+ * After this function is called, you may use redisContextReadReply to
+ * see if there is a reply available. */
+int redisBufferReadDone(redisContext *c, char *buf, ssize_t nread) {
+    if (nread == -1) {
+        if (errno == EAGAIN && !(c->flags & REDIS_BLOCK)) {
+            /* Try again later */
+        } else {
+            __redisSetError(c,REDIS_ERR_IO,NULL);
+            return REDIS_ERR;
+        }
+    } else if (nread == 0) {
+        __redisSetError(c,REDIS_ERR_EOF, sdsnew("Server closed the connection"));
+        return REDIS_ERR;
+    } else {
+        if (redisReaderFeed(c->reader,buf,nread) != REDIS_OK) {
+            __redisSetError(c,c->reader->err,c->reader->errstr);
+            return REDIS_ERR;
+        }
+    }
+    return REDIS_OK;
+}
+#endif
+
 /* Write the output buffer to the socket.
  *
  * Returns REDIS_OK when the buffer is empty, or (a part of) the buffer was
@@ -836,7 +879,7 @@ int redisBufferWrite(redisContext *c, int *done) {
         return REDIS_ERR;
 
     if (sdslen(c->obuf) > 0) {
-        nwritten = write(c->fd,c->obuf,sdslen(c->obuf));
+        nwritten = (int)write(c->fd,c->obuf,sdslen(c->obuf));                   WIN_PORT_FIX /* cast (int) */
         if (nwritten == -1) {
             if ((errno == EAGAIN && !(c->flags & REDIS_BLOCK)) || (errno == EINTR)) {
                 /* Try again later */
@@ -856,6 +899,23 @@ int redisBufferWrite(redisContext *c, int *done) {
     if (done != NULL) *done = (sdslen(c->obuf) == 0);
     return REDIS_OK;
 }
+
+#ifdef _WIN32
+/* Use this function if the caller has already written the data.
+ */
+int redisBufferWriteDone(redisContext *c, int nwritten, int *done) {
+    if (nwritten > 0) {
+        if (nwritten == (signed)sdslen(c->obuf)) {
+            sdsfree(c->obuf);
+            c->obuf = sdsempty();
+        } else {
+            sdsrange(c->obuf, nwritten, -1);
+        }
+    }
+    if (done != NULL) *done = (sdslen(c->obuf) == 0);
+    return REDIS_OK;
+}
+#endif
 
 /* Internal helper function to try and get a reply from the reader,
  * or set an error in the context otherwise. */
